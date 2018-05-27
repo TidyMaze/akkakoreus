@@ -15,6 +15,7 @@ import scala.collection.immutable._
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContextExecutor, Future}
 import scala.language.postfixOps
+import scala.util.{Failure, Success}
 
 case class Article(id: Int,
                    author: String,
@@ -57,7 +58,7 @@ object Client {
         )
       }catch {
         case e:Throwable =>
-          println("DATE RAW: "+ dateRaw)
+          println(s"DATE RAW: -$dateRaw-")
           throw e
       }
     }
@@ -83,26 +84,40 @@ object Client {
     println("FromDate:"+fromDate)
 
     val (fStream: Future[Done], fSink: Future[Done]) = Source(1 to MaxPage)
-      .mapAsync(2)(getArticles)
+      .mapAsync(1)(getArticles)
       .mapConcat(identity)
       .takeWhile(article => article.publishedAt.after(fromDate))
-      .log("Article")
       .map(log)
       .watchTermination()(Keep.right)
       .toMat(Sink.ignore)(Keep.both)
       .run()
 
-    val endOfAll: Future[String] = for {
-      endSink <- fSink
-      endStream <- fStream
-      endPool <- Http().shutdownAllConnectionPools()
-      endSystem <- system.terminate()
-    } yield "stream and HTTP closed"
-
-    endOfAll
-      .map(s => println(s))
+    fStream
+      .flatMap(_ => Future {
+          Thread.sleep(100)
+        })
       .recover{
         case e => Console.err.println(e)
       }
+      .onComplete(tStream => {
+        tStream match {
+          case Success(_) => println("Stream OK")
+          case Failure(ex) =>
+            println("Stream KO: ")
+            throw ex
+        }
+        Http().shutdownAllConnectionPools().onComplete(tPool => {
+          tPool match {
+            case Success(_) => println("Stop pool OK")
+            case Failure(ex) =>
+              println("Pool KO: ")
+              throw ex
+          }
+          system.terminate().onComplete {
+            case Success(_) => println("System terminate OK")
+            case Failure(ex) => throw ex
+          }
+        })
+      })
   }
 }
