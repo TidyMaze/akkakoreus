@@ -1,12 +1,16 @@
-import java.text.SimpleDateFormat
-import java.util.{Calendar, Date}
+import java.io.File
+import java.nio.file.Path
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
+import java.time.{Instant, LocalDateTime, ZoneOffset}
 
-import akka.{Done, NotUsed}
+import akka.Done
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
-import akka.http.scaladsl.model._
-import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.{Keep, Sink, Source}
+import akka.http.scaladsl.model.{HttpEntity, HttpRequest}
+import akka.stream.{ActorMaterializer, IOResult}
+import akka.stream.scaladsl.{FileIO, Keep, Sink, Source}
+import akka.util.ByteString
 import org.jsoup.Jsoup
 import org.jsoup.nodes.{Document, Element}
 
@@ -19,12 +23,12 @@ import scala.util.{Failure, Success}
 
 case class Article(id: Int,
                    author: String,
-                   publishedAt: Date,
+                   publishedAt: Instant,
                    title: String,
                    description: String)
 
 object Client {
-  val MaxPage = 20
+  val MaxPage = Int.MaxValue
 
   def main(args: Array[String]): Unit = {
     implicit val system: ActorSystem = ActorSystem()
@@ -33,8 +37,17 @@ object Client {
 
 
     def body(r: HttpEntity.Strict): String = r.data.utf8String
-    val formatter = new SimpleDateFormat("'le 'd/M/yyy HH:mm:ss")
-    def parseDate(s: String) = formatter.parse(s)
+
+    val formatter: DateTimeFormatter = DateTimeFormatter.ofPattern("'le 'd/M/yyyy H:mm:ss")
+
+
+    def parseDate(dateRaw: String) = try {
+      LocalDateTime.parse(dateRaw, formatter).toInstant(ZoneOffset.UTC)
+    } catch {
+      case e: Throwable =>
+        Console.err.println(s"DATE RAW: -$dateRaw- ex = ${e.getMessage} again : ${formatter.parse(dateRaw)}")
+        throw e
+    }
 
     def getItems: Document => List[Element] = _.select("div.item").listIterator().asScala.toList
 
@@ -44,7 +57,6 @@ object Client {
     }
 
     def itemElementToArticle(el: Element): Article = {
-      val dateRaw = el.selectFirst("span.itemPostDate").text()
       try {
         Article(
           el.selectFirst("h1 > a:nth-child(2)").attr("href")
@@ -52,19 +64,19 @@ object Client {
             .replaceFirst(".html", "").toInt,
           el.selectFirst("span.itemPoster").text()
             .replaceFirst("^Posté par ", ""),
-          parseDate(dateRaw),
+          parseDate(el.selectFirst("span.itemPostDate").text()),
           el.selectFirst("h1.itemTitle").text(),
           el.selectFirst("p.itemText").text()
         )
-      }catch {
-        case e:Throwable =>
-          println(s"DATE RAW: -$dateRaw-")
+      } catch{
+        case e: Throwable =>
+          Console.err.println("Error when converting element :\n"+el)
           throw e
       }
     }
 
     def getArticles(page: Int): Future[Seq[Article]] = {
-      Http().singleRequest(HttpRequest(uri = s"https://www.koreus.com/modules/news/actualiteinsolite${(page-1) * 10}.html"))
+      Http().singleRequest(HttpRequest(uri = s"https://www.koreus.com/modules/news/actualiteinsolite${(page - 1) * 10}.html"))
         .flatMap(_.entity.toStrict(2 second))
         .map(body)
         .map(Jsoup.parse)
@@ -72,31 +84,29 @@ object Client {
         .map(_.map(itemElementToArticle))
     }
 
-    val cal = Calendar.getInstance()
-    cal.add(Calendar.DATE, -3)
-    cal.clear(Calendar.HOUR)
-    cal.clear(Calendar.HOUR_OF_DAY)
-    cal.clear(Calendar.MINUTE)
-    cal.clear(Calendar.SECOND)
-    cal.clear(Calendar.MILLISECOND)
-    val fromDate = cal.getTime
+    val today = Instant.now()
+    val fromDate = today.plus(-100, ChronoUnit.DAYS).truncatedTo(ChronoUnit.DAYS)
 
-    println("FromDate:"+fromDate)
+    println("FromDate:" + formatter.format(fromDate.atOffset(ZoneOffset.UTC)))
 
-    val (fStream: Future[Done], fSink: Future[Done]) = Source(1 to MaxPage)
-      .mapAsync(1)(getArticles)
+    val writeSink = FileIO.toPath(new File("out.txt").toPath)
+
+    val (fStream: Future[Done], fSink: Future[IOResult]) = Source(1 to MaxPage)
+      .mapAsync(10)(getArticles)
+      .throttle(2, 1.second)
       .mapConcat(identity)
-      .takeWhile(article => article.publishedAt.after(fromDate))
+      .takeWhile(article => article.publishedAt.isAfter(fromDate))
       .map(log)
+      .map(a => ByteString(a.toString+"\n"))
       .watchTermination()(Keep.right)
-      .toMat(Sink.ignore)(Keep.both)
+      .toMat(writeSink)(Keep.both)
       .run()
 
     fStream
       .flatMap(_ => Future {
-          Thread.sleep(100)
-        })
-      .recover{
+        Thread.sleep(1000)
+      })
+      .recover {
         case e => Console.err.println(e)
       }
       .onComplete(tStream => {
